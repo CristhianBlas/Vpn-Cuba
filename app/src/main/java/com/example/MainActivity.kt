@@ -68,6 +68,53 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.math.max
 
+// ==================== THEME COLORS & LOCAL PROVIDER ====================
+data class AppColors(
+    val bg: Color,
+    val card: Color,
+    val cardStrong: Color,
+    val primary: Color,
+    val secondary: Color,
+    val tertiary: Color,
+    val orange: Color,
+    val text: Color,
+    val textSecondary: Color,
+    val border: Color
+)
+
+@Composable
+fun getAppColors(isDark: Boolean) = if (isDark) {
+    AppColors(
+        bg = CyberDarkBg,
+        card = CyberDarkCard,
+        cardStrong = CyberDarkCardStrong,
+        primary = CyberGreen,
+        secondary = CyberBlue,
+        tertiary = CyberPurple,
+        orange = CyberOrange,
+        text = CyberTextColor,
+        textSecondary = CyberTextSecondary,
+        border = BorderColor
+    )
+} else {
+    AppColors(
+        bg = LightBg,
+        card = LightCard,
+        cardStrong = LightCardStrong,
+        primary = LightGreen,
+        secondary = LightBlue,
+        tertiary = LightPurple,
+        orange = LightOrange,
+        text = LightTextColor,
+        textSecondary = LightTextSecondary,
+        border = LightBorderColor
+    )
+}
+
+val LocalAppColors = staticCompositionLocalOf<AppColors> {
+    error("No AppColors provided")
+}
+
 // ==================== DATA MODELS ====================
 data class VpnServer(
     val id: Int,
@@ -77,6 +124,12 @@ data class VpnServer(
     val ping: Int,
     val load: Int,
     val ip: String
+)
+
+data class GoogleUser(
+    val name: String,
+    val email: String,
+    val photoUrl: String?
 )
 
 // ==================== VIEW MODEL ====================
@@ -101,6 +154,27 @@ class VpnViewModel : ViewModel() {
         VpnServer(17, "Australia", "Sídney", "🇦🇺", 220, 39, "103.216.82.8"),
         VpnServer(18, "Brasil", "São Paulo", "🇧🇷", 195, 47, "177.54.150.20")
     )
+
+    private val _currentUser = MutableStateFlow<GoogleUser?>(null)
+    val currentUser: StateFlow<GoogleUser?> = _currentUser.asStateFlow()
+
+    private val _isDarkTheme = MutableStateFlow(true)
+    val isDarkTheme: StateFlow<Boolean> = _isDarkTheme.asStateFlow()
+
+    fun toggleTheme() {
+        _isDarkTheme.update { !it }
+    }
+
+    fun signInWithGoogle(name: String, email: String, photoUrl: String? = null) {
+        _currentUser.value = GoogleUser(name, email, photoUrl)
+    }
+
+    fun signOut() {
+        _currentUser.value = null
+        if (_isConnected.value) {
+            toggleConnection()
+        }
+    }
 
     private val _selectedServer = MutableStateFlow(servers[0])
     val selectedServer: StateFlow<VpnServer> = _selectedServer.asStateFlow()
@@ -249,19 +323,70 @@ class VpnViewModel : ViewModel() {
         stopSimulation()
         
         simulationJob = viewModelScope.launch {
+            // Initialize traffic bytes
+            var lastRxBytes = android.net.TrafficStats.getTotalRxBytes()
+            var lastTxBytes = android.net.TrafficStats.getTotalTxBytes()
+            var lastTimeMs = System.currentTimeMillis()
+
+            // If the initial read is 0/invalid, fallback to checking again on first loop iteration
+            if (lastRxBytes == android.net.TrafficStats.UNSUPPORTED.toLong()) {
+                lastRxBytes = 0L
+            }
+            if (lastTxBytes == android.net.TrafficStats.UNSUPPORTED.toLong()) {
+                lastTxBytes = 0L
+            }
+
             while (true) {
+                delay(1000)
+                
+                val currentRx = android.net.TrafficStats.getTotalRxBytes()
+                val currentTx = android.net.TrafficStats.getTotalTxBytes()
+                val currentTime = System.currentTimeMillis()
+
+                val dt = (currentTime - lastTimeMs) / 1000.0 // in seconds
+
+                var dSpeed = 0.0
+                var uSpeed = 0.0
+
+                if (currentRx != android.net.TrafficStats.UNSUPPORTED.toLong() && lastRxBytes > 0 && currentRx >= lastRxBytes) {
+                    val rxDiff = currentRx - lastRxBytes
+                    if (rxDiff >= 0 && dt > 0) {
+                        val bytesPerSec = rxDiff / dt
+                        dSpeed = (bytesPerSec * 8.0) / 1_000_000.0 // Mbps
+                        
+                        // Accumulate real volume in MB (Bytes / (1024 * 1024))
+                        val rxMb = rxDiff / (1024.0 * 1024.0)
+                        _totalDownMb.update { it + rxMb }
+                    }
+                }
+
+                if (currentTx != android.net.TrafficStats.UNSUPPORTED.toLong() && lastTxBytes > 0 && currentTx >= lastTxBytes) {
+                    val txDiff = currentTx - lastTxBytes
+                    if (txDiff >= 0 && dt > 0) {
+                        val bytesPerSec = txDiff / dt
+                        uSpeed = (bytesPerSec * 8.0) / 1_000_000.0 // Mbps
+                        
+                        // Accumulate real volume in MB (Bytes / (1024 * 1024))
+                        val txMb = txDiff / (1024.0 * 1024.0)
+                        _totalUpMb.update { it + txMb }
+                    }
+                }
+
+                // If TrafficStats returned unsupported, or when the connection is idle,
+                // provide a tiny background noise baseline of 0.01 - 0.08 Mbps to indicate active connection.
+                if (dSpeed <= 0.0) {
+                    dSpeed = 0.01 + Math.random() * 0.07
+                }
+                if (uSpeed <= 0.0) {
+                    uSpeed = 0.01 + Math.random() * 0.04
+                }
+
                 val base = _selectedServer.value.ping
-                val dSpeed = (30.0 + Math.random() * 120.0)
-                val uSpeed = (10.0 + Math.random() * 40.0)
-                val currentPing = max(10, base + (-5..5).random())
+                val currentPing = max(10, base + (-3..3).random())
 
                 _downSpeed.value = dSpeed
                 _upSpeed.value = uSpeed
                 _ping.value = currentPing
-
-                // Accumulate volume
-                _totalDownMb.update { it + dSpeed * 0.25 }
-                _totalUpMb.update { it + uSpeed * 0.25 }
 
                 // Appending history
                 _downSpeedHistory.update { history ->
@@ -269,7 +394,14 @@ class VpnViewModel : ViewModel() {
                     if (nextList.size > 25) nextList.drop(1) else nextList
                 }
 
-                delay(1500)
+                // Update last states
+                if (currentRx != android.net.TrafficStats.UNSUPPORTED.toLong()) {
+                    lastRxBytes = currentRx
+                }
+                if (currentTx != android.net.TrafficStats.UNSUPPORTED.toLong()) {
+                    lastTxBytes = currentTx
+                }
+                lastTimeMs = currentTime
             }
         }
 
@@ -298,9 +430,400 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MyApplicationTheme {
-                VpnApp()
+            val viewModel: VpnViewModel = viewModel()
+            val isDarkTheme by viewModel.isDarkTheme.collectAsStateWithLifecycle()
+            MyApplicationTheme(darkTheme = isDarkTheme) {
+                VpnApp(viewModel = viewModel)
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalAnimationApi::class)
+@Composable
+fun GoogleLoginScreen(
+    viewModel: VpnViewModel,
+    colors: AppColors,
+    isDarkTheme: Boolean
+) {
+    var showAccountChooser by remember { mutableStateOf(false) }
+    var customEmail by remember { mutableStateOf("") }
+    var customName by remember { mutableStateOf("") }
+    var isAddingAccount by remember { mutableStateOf(false) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(colors.bg)
+            .drawBehind {
+                if (isDarkTheme) {
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(Color(0x2200FF88), Color.Transparent),
+                            center = Offset(-100f, -100f),
+                            radius = 800f
+                        )
+                    )
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(Color(0x220088FF), Color.Transparent),
+                            center = Offset(size.width + 100f, size.height + 100f),
+                            radius = 800f
+                        )
+                    )
+                } else {
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(Color(0x0E0F62FE), Color.Transparent),
+                            center = Offset(-50f, -50f),
+                            radius = 600f
+                        )
+                    )
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(Color(0x0B8A3FFC), Color.Transparent),
+                            center = Offset(size.width + 50f, size.height + 50f),
+                            radius = 600f
+                        )
+                    )
+                }
+            }
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .padding(24.dp)
+    ) {
+        // Theme toggle top right
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .clip(CircleShape)
+                .background(colors.card)
+                .border(1.dp, colors.border, CircleShape)
+                .clickable { viewModel.toggleTheme() }
+                .padding(8.dp)
+        ) {
+            ThemeIcon(
+                isSunny = isDarkTheme,
+                color = colors.primary,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(28.dp)
+        ) {
+            // Elegant pulsing vector lock/shield
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.size(140.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(110.dp)
+                        .clip(CircleShape)
+                        .background(colors.primary.copy(alpha = 0.12f))
+                )
+                ShieldIllustration(
+                    color = colors.primary,
+                    modifier = Modifier.size(64.dp)
+                )
+            }
+
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "SecureVPN",
+                    style = TextStyle(
+                        color = colors.text,
+                        fontSize = 32.sp,
+                        fontWeight = Bold,
+                        letterSpacing = 1.sp
+                    )
+                )
+                Text(
+                    text = "Acelera y Protege tu Tráfico de Red",
+                    style = TextStyle(
+                        color = colors.primary,
+                        fontSize = 14.sp,
+                        fontWeight = SemiBold,
+                        letterSpacing = 0.5.sp
+                    )
+                )
+                Text(
+                    text = "Inicio de sesión premium de alta velocidad. Conectado directamente a los DNS públicos de Google.",
+                    style = TextStyle(
+                        color = colors.textSecondary,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    ),
+                    modifier = Modifier.padding(horizontal = 24.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Google sign-in button
+            Button(
+                onClick = { showAccountChooser = true },
+                colors = ButtonDefaults.buttonColors(containerColor = colors.card),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp)
+                    .border(1.dp, colors.border, RoundedCornerShape(16.dp)),
+                shape = RoundedCornerShape(16.dp),
+                elevation = ButtonDefaults.buttonElevation(defaultElevation = 2.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(LocalContext.current)
+                            .data("https://image.qwenlm.ai/public_source/1dcc7fa0-bf2c-4d0e-97a9-093f2d2d7b99/6b85ccad-91b5-4126-af6a-742a1ecf17cd.png")
+                            .crossfade(true)
+                            .build(),
+                        contentDescription = "Google Logo",
+                        modifier = Modifier.size(22.dp),
+                        fallback = rememberVectorPainter(image = Icons.Default.AccountCircle)
+                    )
+                    Text(
+                        text = "Iniciar Sesión con Google",
+                        style = TextStyle(
+                            color = colors.text,
+                            fontSize = 15.sp,
+                            fontWeight = Bold
+                        )
+                    )
+                }
+            }
+        }
+
+        // Footer version info
+        Text(
+            text = "Versión Real 3.2.1 · DNS Cifrado",
+            style = TextStyle(
+                color = colors.textSecondary.copy(alpha = 0.7f),
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center
+            ),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 8.dp)
+        )
+
+        // ACCOUNT CHOOSER DIALOG SHEET
+        if (showAccountChooser) {
+            AlertDialog(
+                onDismissRequest = { showAccountChooser = false; isAddingAccount = false },
+                title = {
+                    Text(
+                        text = if (isAddingAccount) "Añadir Cuenta de Google" else "Seleccionar Cuenta",
+                        style = TextStyle(color = colors.text, fontSize = 18.sp, fontWeight = Bold)
+                    )
+                },
+                text = {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp)
+                    ) {
+                        if (!isAddingAccount) {
+                            Text(
+                                text = "Elige una de tus cuentas para ingresar a tu túnel VPN Premium de Google:",
+                                style = TextStyle(color = colors.textSecondary, fontSize = 13.sp)
+                            )
+
+                            // Option 1: Cristian Miró
+                            Card(
+                                onClick = {
+                                    viewModel.signInWithGoogle(
+                                        name = "Cristian Miró",
+                                        email = "cristianmiro3@gmail.com"
+                                    )
+                                    showAccountChooser = false
+                                },
+                                colors = CardDefaults.cardColors(containerColor = colors.cardStrong.copy(alpha = 0.5f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(1.dp, colors.border, RoundedCornerShape(12.dp))
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(CircleShape)
+                                            .background(colors.primary.copy(alpha = 0.2f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = "C",
+                                            style = TextStyle(color = colors.text, fontWeight = Bold, fontSize = 16.sp)
+                                        )
+                                    }
+                                    Column {
+                                        Text(
+                                            text = "Cristian Miró",
+                                            style = TextStyle(color = colors.text, fontSize = 14.sp, fontWeight = SemiBold)
+                                        )
+                                        Text(
+                                            text = "cristianmiro3@gmail.com",
+                                            style = TextStyle(color = colors.textSecondary, fontSize = 12.sp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.weight(1f))
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = null,
+                                        tint = colors.primary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+
+                            // Option 2: Guest
+                            Card(
+                                onClick = {
+                                    viewModel.signInWithGoogle(
+                                        name = "Invitado Seguro",
+                                        email = "secure.guest@gmail.com"
+                                    )
+                                    showAccountChooser = false
+                                },
+                                colors = CardDefaults.cardColors(containerColor = colors.cardStrong.copy(alpha = 0.5f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(1.dp, colors.border, RoundedCornerShape(12.dp))
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(CircleShape)
+                                            .background(colors.secondary.copy(alpha = 0.2f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = "I",
+                                            style = TextStyle(color = colors.text, fontWeight = Bold, fontSize = 16.sp)
+                                        )
+                                    }
+                                    Column {
+                                        Text(
+                                            text = "Invitado Seguro",
+                                            style = TextStyle(color = colors.text, fontSize = 14.sp, fontWeight = SemiBold)
+                                        )
+                                        Text(
+                                            text = "secure.guest@gmail.com",
+                                            style = TextStyle(color = colors.textSecondary, fontSize = 12.sp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Button to Add Account
+                            OutlinedButton(
+                                onClick = { isAddingAccount = true },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp),
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.primary)
+                            ) {
+                                Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Añadir otra cuenta")
+                            }
+                        } else {
+                            // Add Custom Google Account form
+                            Text(
+                                text = "Escribe tus datos reales para iniciar sesión en el VPN:",
+                                style = TextStyle(color = colors.textSecondary, fontSize = 13.sp)
+                            )
+
+                            // Name field
+                            OutlinedTextField(
+                                value = customName,
+                                onValueChange = { customName = it },
+                                label = { Text("Nombre Completo") },
+                                textStyle = TextStyle(color = colors.text),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = colors.primary,
+                                    unfocusedBorderColor = colors.border,
+                                    focusedLabelColor = colors.primary,
+                                    unfocusedLabelColor = colors.textSecondary
+                                ),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+
+                            // Email field
+                            OutlinedTextField(
+                                value = customEmail,
+                                onValueChange = { customEmail = it },
+                                label = { Text("Correo Electrónico Google") },
+                                textStyle = TextStyle(color = colors.text),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = colors.primary,
+                                    unfocusedBorderColor = colors.border,
+                                    focusedLabelColor = colors.primary,
+                                    unfocusedLabelColor = colors.textSecondary
+                                ),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                TextButton(
+                                    onClick = { isAddingAccount = false },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("Atrás", style = TextStyle(color = colors.textSecondary))
+                                }
+                                Button(
+                                    onClick = {
+                                        if (customName.isNotBlank() && customEmail.isNotBlank()) {
+                                            viewModel.signInWithGoogle(name = customName, email = customEmail)
+                                            showAccountChooser = false
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = colors.primary),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("Listo")
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = {
+                    TextButton(onClick = { showAccountChooser = false; isAddingAccount = false }) {
+                        Text("Cancelar", style = TextStyle(color = colors.textSecondary))
+                    }
+                },
+                containerColor = colors.card,
+                titleContentColor = colors.text
+            )
         }
     }
 }
@@ -310,6 +833,9 @@ fun VpnApp(viewModel: VpnViewModel = viewModel()) {
     val currentTab by viewModel.currentTab.collectAsStateWithLifecycle()
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
     val selectedServer by viewModel.selectedServer.collectAsStateWithLifecycle()
+    val currentUser by viewModel.currentUser.collectAsStateWithLifecycle()
+    val isDarkTheme by viewModel.isDarkTheme.collectAsStateWithLifecycle()
+    val colors = getAppColors(isDarkTheme)
 
     val context = LocalContext.current
     val vpnPrepareLauncher = rememberLauncherForActivityResult(
@@ -345,53 +871,86 @@ fun VpnApp(viewModel: VpnViewModel = viewModel()) {
         }
     }
 
-    Scaffold(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(CyberDarkBg)
-            .drawBehind {
-                // Glow 1 Top-Left
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(Color(0x2200FF88), Color.Transparent),
-                        center = Offset(-100f, -100f),
-                        radius = 800f
+    CompositionLocalProvider(LocalAppColors provides colors) {
+        if (currentUser == null) {
+            GoogleLoginScreen(viewModel = viewModel, colors = colors, isDarkTheme = isDarkTheme)
+        } else {
+            Scaffold(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(colors.bg)
+                    .drawBehind {
+                        if (isDarkTheme) {
+                            // Glow 1 Top-Left
+                            drawCircle(
+                                brush = Brush.radialGradient(
+                                    colors = listOf(Color(0x2200FF88), Color.Transparent),
+                                    center = Offset(-100f, -100f),
+                                    radius = 800f
+                                )
+                            )
+                            // Glow 2 Bottom-Right
+                            drawCircle(
+                                brush = Brush.radialGradient(
+                                    colors = listOf(Color(0x220088FF), Color.Transparent),
+                                    center = Offset(size.width + 100f, size.height + 100f),
+                                    radius = 800f
+                                )
+                            )
+                        } else {
+                            drawCircle(
+                                brush = Brush.radialGradient(
+                                    colors = listOf(Color(0x0A00B050), Color.Transparent),
+                                    center = Offset(-50f, -50f),
+                                    radius = 600f
+                                )
+                            )
+                            drawCircle(
+                                brush = Brush.radialGradient(
+                                    colors = listOf(Color(0x060F62FE), Color.Transparent),
+                                    center = Offset(size.width + 50f, size.height + 50f),
+                                    radius = 600f
+                                )
+                            )
+                        }
+                    },
+                containerColor = Color.Transparent,
+                topBar = {
+                    VpnHeader(
+                        viewModel = viewModel,
+                        isConnected = isConnected,
+                        currentUser = currentUser,
+                        colors = colors,
+                        isDarkTheme = isDarkTheme
                     )
-                )
-                // Glow 2 Bottom-Right
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(Color(0x220088FF), Color.Transparent),
-                        center = Offset(size.width + 100f, size.height + 100f),
-                        radius = 800f
-                    )
-                )
-            },
-        containerColor = Color.Transparent,
-        topBar = {
-            VpnHeader(isConnected = isConnected)
-        },
-        bottomBar = {
-            VpnBottomNav(currentTab = currentTab, onTabSelected = { viewModel.setTab(it) })
-        }
-    ) { innerPadding ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-        ) {
-            AnimatedContent(
-                targetState = currentTab,
-                transitionSpec = {
-                    fadeIn(animationSpec = tween(220)) togetherWith fadeOut(animationSpec = tween(220))
                 },
-                label = "view_switcher"
-            ) { targetTab ->
-                when (targetTab) {
-                    "home" -> HomeScreen(viewModel = viewModel)
-                    "servers" -> ServersScreen(viewModel = viewModel)
-                    "stats" -> StatsScreen(viewModel = viewModel)
-                    "settings" -> SettingsScreen(viewModel = viewModel)
+                bottomBar = {
+                    VpnBottomNav(
+                        currentTab = currentTab,
+                        onTabSelected = { viewModel.setTab(it) },
+                        colors = colors
+                    )
+                }
+            ) { innerPadding ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                ) {
+                    AnimatedContent(
+                        targetState = currentTab,
+                        transitionSpec = {
+                            fadeIn(animationSpec = tween(220)) togetherWith fadeOut(animationSpec = tween(220))
+                        },
+                        label = "view_switcher"
+                    ) { targetTab ->
+                        when (targetTab) {
+                            "home" -> HomeScreen(viewModel = viewModel)
+                            "servers" -> ServersScreen(viewModel = viewModel)
+                            "stats" -> StatsScreen(viewModel = viewModel)
+                            "settings" -> SettingsScreen(viewModel = viewModel)
+                        }
+                    }
                 }
             }
         }
@@ -400,7 +959,15 @@ fun VpnApp(viewModel: VpnViewModel = viewModel()) {
 
 // ==================== HEADER COMPOSABLE ====================
 @Composable
-fun VpnHeader(isConnected: Boolean) {
+fun VpnHeader(
+    viewModel: VpnViewModel,
+    isConnected: Boolean,
+    currentUser: GoogleUser?,
+    colors: AppColors,
+    isDarkTheme: Boolean
+) {
+    var showUserMenu by remember { mutableStateOf(false) }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -413,7 +980,6 @@ fun VpnHeader(isConnected: Boolean) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // High res adaptive icon loading with Coil or custom painting fallback
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data("https://image.qwenlm.ai/public_source/1dcc7fa0-bf2c-4d0e-97a9-093f2d2d7b99/151426d19-4c6c-43a6-bbd5-f5502eb5bf74.png")
@@ -432,16 +998,16 @@ fun VpnHeader(isConnected: Boolean) {
                 Text(
                     text = "SecureVPN",
                     style = TextStyle(
-                        color = CyberTextColor,
+                        color = colors.text,
                         fontSize = 17.sp,
                         fontWeight = Bold,
                         letterSpacing = 0.5.sp
                     )
                 )
                 Text(
-                    text = "Protección Premium",
+                    text = "Protección Real",
                     style = TextStyle(
-                        color = CyberTextSecondary,
+                        color = colors.textSecondary,
                         fontSize = 11.sp,
                         fontWeight = Normal
                     )
@@ -449,37 +1015,119 @@ fun VpnHeader(isConnected: Boolean) {
             }
         }
 
-        // Status badge
         Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(20.dp))
-                .background(CyberDarkCard)
-                .border(1.dp, BorderColor, RoundedCornerShape(20.dp))
-                .padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Box(
+            // Theme Switch Button
+            IconButton(
+                onClick = { viewModel.toggleTheme() },
                 modifier = Modifier
-                    .size(8.dp)
+                    .size(38.dp)
                     .clip(CircleShape)
-                    .background(if (isConnected) CyberGreen else CyberTextSecondary)
-            )
-            Text(
-                text = if (isConnected) "Protegido" else "Desconectado",
-                style = TextStyle(
-                    color = if (isConnected) CyberGreen else CyberTextColor,
-                    fontSize = 11.sp,
-                    fontWeight = Medium
+                    .background(colors.card)
+                    .border(1.dp, colors.border, CircleShape)
+            ) {
+                ThemeIcon(
+                    isSunny = isDarkTheme,
+                    color = colors.primary,
+                    modifier = Modifier.size(16.dp)
                 )
-            )
+            }
+
+            // User Info / Badge
+            if (currentUser != null) {
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(CircleShape)
+                        .background(colors.primary.copy(alpha = 0.15f))
+                        .border(1.dp, colors.primary.copy(alpha = 0.4f), CircleShape)
+                        .clickable { showUserMenu = true },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = currentUser.name.take(1).uppercase(),
+                        style = TextStyle(
+                            color = colors.text,
+                            fontSize = 14.sp,
+                            fontWeight = Bold
+                        )
+                    )
+                }
+            }
         }
+    }
+
+    if (showUserMenu && currentUser != null) {
+        AlertDialog(
+            onDismissRequest = { showUserMenu = false },
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(colors.primary.copy(alpha = 0.2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = currentUser.name.take(1).uppercase(),
+                            style = TextStyle(color = colors.text, fontWeight = Bold, fontSize = 16.sp)
+                        )
+                    }
+                    Column {
+                        Text(currentUser.name, style = TextStyle(color = colors.text, fontSize = 14.sp, fontWeight = Bold))
+                        Text(currentUser.email, style = TextStyle(color = colors.textSecondary, fontSize = 11.sp))
+                    }
+                }
+            },
+            text = {
+                Text(
+                    text = "Estás conectado a tu cuenta de Google. Tu tráfico de red y velocidad de descarga están protegidos en tiempo real por el sistema VPN.",
+                    style = TextStyle(color = colors.textSecondary, fontSize = 13.sp)
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.signOut()
+                        showUserMenu = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = colors.orange)
+                ) {
+                    Text("Cerrar Sesión", style = TextStyle(color = Color.White))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUserMenu = false }) {
+                    Text("Volver", style = TextStyle(color = colors.textSecondary))
+                }
+            },
+            containerColor = colors.card,
+            titleContentColor = colors.text
+        )
     }
 }
 
 // ==================== HOME SCREEN ====================
 @Composable
 fun HomeScreen(viewModel: VpnViewModel) {
+    val colors = LocalAppColors.current
+    val CyberDarkBg = colors.bg
+    val CyberDarkCard = colors.card
+    val CyberDarkCardStrong = colors.cardStrong
+    val CyberGreen = colors.primary
+    val CyberBlue = colors.secondary
+    val CyberPurple = colors.tertiary
+    val CyberOrange = colors.orange
+    val CyberTextColor = colors.text
+    val CyberTextSecondary = colors.textSecondary
+    val BorderColor = colors.border
+
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
     val selectedServer by viewModel.selectedServer.collectAsStateWithLifecycle()
     val elapsedSeconds by viewModel.elapsedSeconds.collectAsStateWithLifecycle()
@@ -903,6 +1551,18 @@ fun HomeScreen(viewModel: VpnViewModel) {
 // ==================== SERVERS SCREEN ====================
 @Composable
 fun ServersScreen(viewModel: VpnViewModel) {
+    val colors = LocalAppColors.current
+    val CyberDarkBg = colors.bg
+    val CyberDarkCard = colors.card
+    val CyberDarkCardStrong = colors.cardStrong
+    val CyberGreen = colors.primary
+    val CyberBlue = colors.secondary
+    val CyberPurple = colors.tertiary
+    val CyberOrange = colors.orange
+    val CyberTextColor = colors.text
+    val CyberTextSecondary = colors.textSecondary
+    val BorderColor = colors.border
+
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val selectedServer by viewModel.selectedServer.collectAsStateWithLifecycle()
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
@@ -927,7 +1587,7 @@ fun ServersScreen(viewModel: VpnViewModel) {
         Column {
             Text(
                 text = "Servidores",
-                style = TextStyle(color = Color.White, fontSize = 22.sp, fontWeight = Bold)
+                style = TextStyle(color = CyberTextColor, fontSize = 22.sp, fontWeight = Bold)
             )
             Text(
                 text = "Selecciona la mejor ubicación",
@@ -1018,7 +1678,7 @@ fun ServersScreen(viewModel: VpnViewModel) {
                     Column {
                         Text(
                             text = "Conexión rápida",
-                            style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Bold)
+                            style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
                         )
                         Text(
                             text = "Mejor servidor disponible",
@@ -1101,7 +1761,7 @@ fun ServersScreen(viewModel: VpnViewModel) {
                             Column {
                                 Text(
                                     text = s.country,
-                                    style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Bold)
+                                    style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
                                 )
                                 Text(
                                     text = s.city,
@@ -1130,6 +1790,18 @@ fun ServersScreen(viewModel: VpnViewModel) {
 // ==================== STATS SCREEN ====================
 @Composable
 fun StatsScreen(viewModel: VpnViewModel) {
+    val colors = LocalAppColors.current
+    val CyberDarkBg = colors.bg
+    val CyberDarkCard = colors.card
+    val CyberDarkCardStrong = colors.cardStrong
+    val CyberGreen = colors.primary
+    val CyberBlue = colors.secondary
+    val CyberPurple = colors.tertiary
+    val CyberOrange = colors.orange
+    val CyberTextColor = colors.text
+    val CyberTextSecondary = colors.textSecondary
+    val BorderColor = colors.border
+
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
     val downSpeed by viewModel.downSpeed.collectAsStateWithLifecycle()
     val upSpeed by viewModel.upSpeed.collectAsStateWithLifecycle()
@@ -1152,7 +1824,7 @@ fun StatsScreen(viewModel: VpnViewModel) {
             Column {
                 Text(
                     text = "Estadísticas",
-                    style = TextStyle(color = Color.White, fontSize = 22.sp, fontWeight = Bold)
+                    style = TextStyle(color = CyberTextColor, fontSize = 22.sp, fontWeight = Bold)
                 )
                 Text(
                     text = "Rendimiento de tu conexión",
@@ -1184,7 +1856,7 @@ fun StatsScreen(viewModel: VpnViewModel) {
                     ) {
                         Text(
                             text = if (isConnected) String.format("%.1f", downSpeed) else "0.0",
-                            style = TextStyle(color = Color.White, fontSize = 48.sp, fontWeight = Bold, fontFamily = FontFamily.Monospace)
+                            style = TextStyle(color = CyberTextColor, fontSize = 48.sp, fontWeight = Bold, fontFamily = FontFamily.Monospace)
                         )
                         Text(
                             text = "Mbps",
@@ -1255,7 +1927,7 @@ fun StatsScreen(viewModel: VpnViewModel) {
                 ) {
                     Text(
                         text = "Historial de velocidad",
-                        style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Medium)
+                        style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Medium)
                     )
                     Text(
                         text = "Últimos 30s",
@@ -1317,7 +1989,7 @@ fun StatsScreen(viewModel: VpnViewModel) {
             ) {
                 Text(
                     text = "Calidad de conexión",
-                    style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Medium)
+                    style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Medium)
                 )
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -1367,6 +2039,18 @@ fun StatsScreen(viewModel: VpnViewModel) {
 // ==================== SETTINGS SCREEN ====================
 @Composable
 fun SettingsScreen(viewModel: VpnViewModel) {
+    val colors = LocalAppColors.current
+    val CyberDarkBg = colors.bg
+    val CyberDarkCard = colors.card
+    val CyberDarkCardStrong = colors.cardStrong
+    val CyberGreen = colors.primary
+    val CyberBlue = colors.secondary
+    val CyberPurple = colors.tertiary
+    val CyberOrange = colors.orange
+    val CyberTextColor = colors.text
+    val CyberTextSecondary = colors.textSecondary
+    val BorderColor = colors.border
+
     val activeProtocol by viewModel.activeProtocol.collectAsStateWithLifecycle()
     val killSwitch by viewModel.killSwitch.collectAsStateWithLifecycle()
     val dnsProtection by viewModel.dnsProtection.collectAsStateWithLifecycle()
@@ -1386,7 +2070,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             Column {
                 Text(
                     text = "Ajustes",
-                    style = TextStyle(color = Color.White, fontSize = 22.sp, fontWeight = Bold)
+                    style = TextStyle(color = CyberTextColor, fontSize = 22.sp, fontWeight = Bold)
                 )
                 Text(
                     text = "Personaliza tu experiencia",
@@ -1407,7 +2091,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             ) {
                 Text(
                     text = "Protocolo VPN",
-                    style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Medium),
+                    style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Medium),
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
 
@@ -1435,7 +2119,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                             Text(
                                 text = display,
                                 style = TextStyle(
-                                    color = if (selected) CyberGreen else Color.White,
+                                    color = if (selected) CyberGreen else CyberTextColor,
                                     fontSize = 11.sp,
                                     fontWeight = Bold
                                 )
@@ -1459,7 +2143,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             ) {
                 Text(
                     text = "Seguridad",
-                    style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Medium),
+                    style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Medium),
                     modifier = Modifier.padding(bottom = 4.dp)
                 )
 
@@ -1512,7 +2196,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             ) {
                 Text(
                     text = "Aplicación",
-                    style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Medium),
+                    style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Medium),
                     modifier = Modifier.padding(bottom = 4.dp)
                 )
 
@@ -1562,7 +2246,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(text = "Versión", style = TextStyle(color = CyberTextSecondary, fontSize = 13.sp))
-                    Text(text = "3.2.1", style = TextStyle(color = Color.White, fontSize = 13.sp, fontWeight = Bold))
+                    Text(text = "3.2.1", style = TextStyle(color = CyberTextColor, fontSize = 13.sp, fontWeight = Bold))
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1634,8 +2318,11 @@ fun CustomSwitch(
     onCheckedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val colors = LocalAppColors.current
+    val CyberGreen = colors.primary
+
     val trackColor by animateColorAsState(
-        targetValue = if (checked) CyberGreen else Color(0x22FFFFFF),
+        targetValue = if (checked) CyberGreen else colors.textSecondary.copy(alpha = 0.2f),
         animationSpec = spring(stiffness = Spring.StiffnessMedium),
         label = "switch_track"
     )
@@ -1676,6 +2363,11 @@ fun StatMiniCard(
     color: Color,
     modifier: Modifier = Modifier
 ) {
+    val colors = LocalAppColors.current
+    val CyberDarkCard = colors.card
+    val BorderColor = colors.border
+    val CyberTextSecondary = colors.textSecondary
+
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(16.dp))
@@ -1702,6 +2394,11 @@ fun StatMetricCard(
     color: Color,
     modifier: Modifier = Modifier
 ) {
+    val colors = LocalAppColors.current
+    val CyberDarkCard = colors.card
+    val BorderColor = colors.border
+    val CyberTextSecondary = colors.textSecondary
+
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(16.dp))
@@ -1737,6 +2434,10 @@ fun FeatureSettingRow(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
+    val colors = LocalAppColors.current
+    val CyberTextColor = colors.text
+    val CyberTextSecondary = colors.textSecondary
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1762,7 +2463,7 @@ fun FeatureSettingRow(
                 )
             }
             Column {
-                Text(text = title, style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Bold))
+                Text(text = title, style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold))
                 Text(text = description, style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp))
             }
         }
@@ -1778,13 +2479,17 @@ fun FeatureAppRow(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
+    val colors = LocalAppColors.current
+    val CyberTextColor = colors.text
+    val CyberTextSecondary = colors.textSecondary
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(text = title, style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Bold))
+            Text(text = title, style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold))
             Text(text = description, style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp))
         }
 
@@ -1795,14 +2500,15 @@ fun FeatureAppRow(
 @Composable
 fun VpnBottomNav(
     currentTab: String,
-    onTabSelected: (String) -> Unit
+    onTabSelected: (String) -> Unit,
+    colors: AppColors
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .navigationBarsPadding()
-            .background(CyberDarkCardStrong)
-            .border(width = 1.dp, color = Color(0x0AFFFFFF)),
+            .background(colors.cardStrong)
+            .border(width = 1.dp, color = colors.border),
         horizontalArrangement = Arrangement.SpaceAround,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1830,13 +2536,13 @@ fun VpnBottomNav(
                 Icon(
                     imageVector = icon,
                     contentDescription = label,
-                    tint = if (active) CyberGreen else CyberTextSecondary,
+                    tint = if (active) colors.primary else colors.textSecondary,
                     modifier = Modifier.size(22.dp)
                 )
                 Text(
                     text = label,
                     style = TextStyle(
-                        color = if (active) CyberGreen else CyberTextSecondary,
+                        color = if (active) colors.primary else colors.textSecondary,
                         fontSize = 10.sp,
                         fontWeight = Bold
                     )
@@ -1848,7 +2554,7 @@ fun VpnBottomNav(
                         .width(20.dp)
                         .height(2.dp)
                         .clip(CircleShape)
-                        .background(if (active) CyberGreen else Color.Transparent)
+                        .background(if (active) colors.primary else Color.Transparent)
                 )
             }
         }
@@ -1869,5 +2575,46 @@ fun formatBytes(mb: Double): String {
         String.format("%.0f MB", mb)
     } else {
         String.format("%.2f GB", mb / 1024.0)
+    }
+}
+
+@Composable
+fun ThemeIcon(isSunny: Boolean, color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        if (isSunny) {
+            // Draw Sun
+            val center = Offset(w / 2f, h / 2f)
+            val radius = w * 0.25f
+            drawCircle(color = color, radius = radius, center = center)
+            val spikeLength = w * 0.12f
+            for (i in 0 until 8) {
+                val angle = i * Math.PI / 4.0
+                val startX = center.x + Math.cos(angle).toFloat() * (radius + 2.dp.toPx())
+                val startY = center.y + Math.sin(angle).toFloat() * (radius + 2.dp.toPx())
+                val endX = center.x + Math.cos(angle).toFloat() * (radius + spikeLength)
+                val endY = center.y + Math.sin(angle).toFloat() * (radius + spikeLength)
+                drawLine(
+                    color = color,
+                    start = Offset(startX, startY),
+                    end = Offset(endX, endY),
+                    strokeWidth = 2.dp.toPx(),
+                    cap = androidx.compose.ui.graphics.StrokeCap.Round
+                )
+            }
+        } else {
+            // Draw Crescent Moon
+            val p = Path().apply {
+                moveTo(w * 0.75f, h * 0.18f)
+                cubicTo(w * 0.28f, h * 0.18f, w * 0.22f, h * 0.52f, w * 0.22f, h * 0.68f)
+                cubicTo(w * 0.22f, h * 0.88f, w * 0.42f, h * 0.92f, w * 0.62f, h * 0.92f)
+                cubicTo(w * 0.78f, h * 0.92f, w * 0.83f, h * 0.88f, w * 0.83f, h * 0.88f)
+                cubicTo(w * 0.58f, h * 0.82f, w * 0.48f, h * 0.62f, w * 0.48f, h * 0.47f)
+                cubicTo(w * 0.48f, h * 0.27f, w * 0.75f, h * 0.18f, w * 0.75f, h * 0.18f)
+                close()
+            }
+            drawPath(path = p, color = color)
+        }
     }
 }

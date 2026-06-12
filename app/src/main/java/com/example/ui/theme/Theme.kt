@@ -22,25 +22,24 @@ private val DarkColorScheme = darkColorScheme(
     onSurface = CyberTextColor,
 )
 
-private val LightColorScheme = darkColorScheme(
-    primary = CyberGreen,
-    secondary = CyberBlue,
-    tertiary = CyberPurple,
-    background = CyberDarkBg,
-    surface = CyberDarkBg,
-    onPrimary = CyberDarkBg,
-    onSecondary = CyberTextColor,
-    onBackground = CyberTextColor,
-    onSurface = CyberTextColor,
+private val LightColorScheme = lightColorScheme(
+    primary = LightGreen,
+    secondary = LightBlue,
+    tertiary = LightPurple,
+    background = LightBg,
+    surface = LightCard,
+    onPrimary = LightBg,
+    onSecondary = LightTextColor,
+    onBackground = LightTextColor,
+    onSurface = LightTextColor,
 )
 
 @Composable
 fun MyApplicationTheme(
-  darkTheme: Boolean = true, // Force premium dark theme for VPN client aesthetic
-  dynamicColor: Boolean = false, // Set to false to preserve strict cyberpunk branding
-  content: @Composable () -> Unit,
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    content: @Composable () -> Unit,
 ) {
-  val colorScheme = DarkColorScheme
+    val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
 
-  MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
+    MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
 }
