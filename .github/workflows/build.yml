@@ -35,5 +35,11 @@ jobs:
           cp .env.example .env
         fi
 
+    - name: Prepare Debug Keystore
+      run: |
+        if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
+          base64 -d debug.keystore.base64 > debug.keystore || base64 --decode debug.keystore.base64 > debug.keystore
+        fi
+
     - name: Build with Gradle
       run: gradle assembleDebug
