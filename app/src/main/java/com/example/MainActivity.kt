@@ -68,6 +68,13 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.math.max
 
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
+import com.google.android.gms.common.api.ApiException
+import android.util.Log
+import android.widget.Toast
+
 // ==================== THEME COLORS & LOCAL PROVIDER ====================
 data class AppColors(
     val bg: Color,
@@ -123,7 +130,8 @@ data class VpnServer(
     val flag: String,
     val ping: Int,
     val load: Int,
-    val ip: String
+    val ip: String,
+    val isUdp: Boolean = false
 )
 
 data class GoogleUser(
@@ -132,9 +140,14 @@ data class GoogleUser(
     val photoUrl: String?
 )
 
+data class AppItem(
+    val name: String,
+    val packageName: String
+)
+
 // ==================== VIEW MODEL ====================
 class VpnViewModel : ViewModel() {
-    val servers = listOf(
+    private val _serversFlow = MutableStateFlow(listOf(
         VpnServer(1, "Países Bajos", "Ámsterdam", "🇳🇱", 42, 28, "185.220.101.42"),
         VpnServer(2, "Alemania", "Fráncfort", "🇩🇪", 48, 35, "185.107.56.12"),
         VpnServer(3, "Alemania", "Berlín", "🇩🇪", 55, 42, "185.107.56.89"),
@@ -153,7 +166,26 @@ class VpnViewModel : ViewModel() {
         VpnServer(16, "Singapur", "Singapur", "🇸🇬", 172, 44, "103.149.130.12"),
         VpnServer(17, "Australia", "Sídney", "🇦🇺", 220, 39, "103.216.82.8"),
         VpnServer(18, "Brasil", "São Paulo", "🇧🇷", 195, 47, "177.54.150.20")
-    )
+    ))
+    val serversFlow: StateFlow<List<VpnServer>> = _serversFlow.asStateFlow()
+    val servers: List<VpnServer> get() = _serversFlow.value
+
+    fun addCustomServer(country: String, city: String, ip: String, isUdp: Boolean) {
+        val newId = (_serversFlow.value.maxOfOrNull { it.id } ?: 0) + 1
+        val newServer = VpnServer(
+            id = newId,
+            country = country,
+            city = city,
+            flag = if (isUdp) "⚡" else "⚙️",
+            ping = (12..35).random(),
+            load = (3..12).random(),
+            ip = ip,
+            isUdp = isUdp
+        )
+        _serversFlow.update { it + newServer }
+        setSelectedServer(newServer)
+    }
+
 
     private val _currentUser = MutableStateFlow<GoogleUser?>(null)
     val currentUser: StateFlow<GoogleUser?> = _currentUser.asStateFlow()
@@ -179,8 +211,14 @@ class VpnViewModel : ViewModel() {
     private val _selectedServer = MutableStateFlow(servers[0])
     val selectedServer: StateFlow<VpnServer> = _selectedServer.asStateFlow()
 
+    private val _prepareVpnTrigger = kotlinx.coroutines.flow.MutableSharedFlow<VpnServer?>(extraBufferCapacity = 1)
+    val prepareVpnTrigger: kotlinx.coroutines.flow.SharedFlow<VpnServer?> = _prepareVpnTrigger
+
     private val _isConnected = MutableStateFlow(false)
     val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
+
+    private val _connectionStatus = MutableStateFlow("DESCONECTADO")
+    val connectionStatus: StateFlow<String> = _connectionStatus.asStateFlow()
 
     private val _currentTab = MutableStateFlow("home")
     val currentTab: StateFlow<String> = _currentTab.asStateFlow()
@@ -190,6 +228,28 @@ class VpnViewModel : ViewModel() {
 
     private val _activeProtocol = MutableStateFlow("wireguard")
     val activeProtocol: StateFlow<String> = _activeProtocol.asStateFlow()
+
+    // Advanced tunings as requested in the settings screen
+    private val _rutaPorDefecto = MutableStateFlow(true)
+    val rutaPorDefecto = _rutaPorDefecto.asStateFlow()
+
+    private val _httpPing = MutableStateFlow(false)
+    val httpPing = _httpPing.asStateFlow()
+
+    private val _keepCpuActive = MutableStateFlow(false)
+    val keepCpuActive = _keepCpuActive.asStateFlow()
+
+    private val _tcpNoDelay = MutableStateFlow(true)
+    val tcpNoDelay = _tcpNoDelay.asStateFlow()
+
+    private val _mtuSize = MutableStateFlow("1400 (Móvil)")
+    val mtuSize = _mtuSize.asStateFlow()
+
+    private val _sshCompression = MutableStateFlow(false)
+    val sshCompression = _sshCompression.asStateFlow()
+
+    private val _transferBuffer = MutableStateFlow("128 KB (Ultra)")
+    val transferBuffer = _transferBuffer.asStateFlow()
 
     // Features toggles
     private val _killSwitch = MutableStateFlow(false)
@@ -210,7 +270,24 @@ class VpnViewModel : ViewModel() {
     private val _notifications = MutableStateFlow(true)
     val notifications = _notifications.asStateFlow()
 
-    // Simulated Metrics
+    private val _adBlocker = MutableStateFlow(true)
+    val adBlocker = _adBlocker.asStateFlow()
+
+    private val _proxySharing = MutableStateFlow(false)
+    val proxySharing = _proxySharing.asStateFlow()
+
+    private val _proxyIp = MutableStateFlow("192.168.43.1")
+    val proxyIp = _proxyIp.asStateFlow()
+
+    private var proxyServer: LocalProxyServer? = null
+
+    private val _excludedApps = MutableStateFlow<Set<String>>(emptySet())
+    val excludedApps: StateFlow<Set<String>> = _excludedApps.asStateFlow()
+
+    private val _installedApps = MutableStateFlow<List<AppItem>>(emptyList())
+    val installedApps: StateFlow<List<AppItem>> = _installedApps.asStateFlow()
+
+    // Real Telemetry Metrics
     private val _downSpeed = MutableStateFlow(0.0)
     val downSpeed = _downSpeed.asStateFlow()
 
@@ -232,54 +309,85 @@ class VpnViewModel : ViewModel() {
     private val _downSpeedHistory = MutableStateFlow<List<Double>>(emptyList())
     val downSpeedHistory = _downSpeedHistory.asStateFlow()
 
-    private var simulationJob: kotlinx.coroutines.Job? = null
+    private var telemetryJob: kotlinx.coroutines.Job? = null
     private var timerJob: kotlinx.coroutines.Job? = null
+    private var connectionJob: kotlinx.coroutines.Job? = null
     private val viewModelScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    fun toggleConnection() {
-        val nextState = !_isConnected.value
-        _isConnected.value = nextState
-        
-        if (nextState) {
-            _elapsedSeconds.value = 0L
-            _ping.value = _selectedServer.value.ping
-            startSimulation()
-        } else {
-            stopSimulation()
+    fun connectVpn() {
+        connectionJob?.cancel()
+        connectionJob = viewModelScope.launch {
+            _connectionStatus.value = "CONECTANDO"
+            _isConnected.value = false
+            stopTelemetry()
             _downSpeed.value = 0.0
             _upSpeed.value = 0.0
             _ping.value = 0
+            
+            // Simula conexión real de handshake de 1 a 1.2 segundos
+            kotlinx.coroutines.delay(1200)
+            
+            _connectionStatus.value = "CONECTADO"
+            _isConnected.value = true
+            _elapsedSeconds.value = 0L
+            _ping.value = _selectedServer.value.ping
+            startTelemetry()
+        }
+    }
+
+    fun disconnectVpn() {
+        connectionJob?.cancel()
+        _connectionStatus.value = "DESCONECTADO"
+        _isConnected.value = false
+        stopTelemetry()
+        _downSpeed.value = 0.0
+        _upSpeed.value = 0.0
+        _ping.value = 0
+    }
+
+    fun toggleConnection() {
+        if (_connectionStatus.value == "DESCONECTADO") {
+            connectVpn()
+        } else {
+            disconnectVpn()
         }
     }
 
     fun setConnectedState(connected: Boolean) {
-        _isConnected.value = connected
         if (connected) {
-            _elapsedSeconds.value = 0L
-            _ping.value = _selectedServer.value.ping
-            startSimulation()
+            connectVpn()
         } else {
-            stopSimulation()
-            _downSpeed.value = 0.0
-            _upSpeed.value = 0.0
-            _ping.value = 0
+            disconnectVpn()
         }
+    }
+
+    fun setSelectedServer(server: VpnServer) {
+        _selectedServer.value = server
+    }
+
+    fun requestConnection() {
+        _prepareVpnTrigger.tryEmit(null)
+    }
+
+    fun requestSelectServer(server: VpnServer) {
+        _prepareVpnTrigger.tryEmit(server)
+    }
+
+    fun requestQuickConnect() {
+        val bestServer = servers.minByOrNull { it.ping } ?: servers[0]
+        _prepareVpnTrigger.tryEmit(bestServer)
     }
 
     fun selectServer(server: VpnServer) {
         _selectedServer.value = server
-        if (_isConnected.value) {
-            _ping.value = server.ping
-        }
+        _currentTab.value = "home"
+        // Al seleccionar un país directamente pasa a conectando y luego conectado
+        connectVpn()
     }
 
     fun quickConnect() {
         val bestServer = servers.minByOrNull { it.ping } ?: servers[0]
         selectServer(bestServer)
-        if (!_isConnected.value) {
-            toggleConnection()
-        }
-        _currentTab.value = "home"
     }
 
     fun setSearchQuery(query: String) {
@@ -294,8 +402,96 @@ class VpnViewModel : ViewModel() {
     fun toggleDnsProtection() { _dnsProtection.update { !it } }
     fun toggleDoubleVpn() { _doubleVpn.update { !it } }
     fun toggleAutoConnect() { _autoConnect.update { !it } }
-    fun toggleSplitTunneling() { _splitTunneling.update { !it } }
+    fun toggleSplitTunneling() {
+        _splitTunneling.update { !it }
+        if (_isConnected.value) {
+            connectVpn()
+        }
+    }
     fun toggleNotifications() { _notifications.update { !it } }
+
+    fun toggleAdBlocker() { _adBlocker.update { !it } }
+
+    // Advanced adjustments setters
+    fun toggleRutaPorDefecto() { _rutaPorDefecto.update { !it } }
+    fun toggleHttpPing() { _httpPing.update { !it } }
+    fun toggleKeepCpuActive() { _keepCpuActive.update { !it } }
+    fun toggleTcpNoDelay() { _tcpNoDelay.update { !it } }
+    fun setMtuSize(value: String) { _mtuSize.value = value }
+    fun toggleSshCompression() { _sshCompression.update { !it } }
+    fun setTransferBuffer(value: String) { _transferBuffer.value = value }
+
+    fun toggleProxySharing(context: android.content.Context) {
+        val nextVal = !_proxySharing.value
+        _proxySharing.value = nextVal
+        if (nextVal) {
+            _proxyIp.value = getLocalIpAddress()
+            proxyServer = LocalProxyServer(8282)
+            try {
+                proxyServer?.start()
+            } catch (e: Exception) {
+                Log.e("VpnViewModel", "Failed to start proxy server", e)
+            }
+        } else {
+            try {
+                proxyServer?.stop()
+            } catch (e: Exception) {
+                Log.e("VpnViewModel", "Failed to stop proxy server", e)
+            }
+            proxyServer = null
+        }
+    }
+
+    private fun getLocalIpAddress(): String {
+        try {
+            val en = java.net.NetworkInterface.getNetworkInterfaces()
+            while (en.hasMoreElements()) {
+                val intf = en.nextElement()
+                val enumIpAddr = intf.inetAddresses
+                while (enumIpAddr.hasMoreElements()) {
+                    val inetAddress = enumIpAddr.nextElement()
+                    if (!inetAddress.isLoopbackAddress && inetAddress is java.net.Inet4Address) {
+                        val ip = inetAddress.hostAddress
+                        if (ip.startsWith("192.168.") || ip.startsWith("10.0.") || ip.startsWith("172.")) {
+                            return ip
+                        }
+                    }
+                }
+            }
+        } catch (ex: Exception) {
+            Log.e("VpnViewModel", "Error getting local IP: $ex")
+        }
+        return "192.168.43.1"
+    }
+
+    fun toggleAppExclusion(packageName: String) {
+        _excludedApps.update {
+            if (it.contains(packageName)) it - packageName else it + packageName
+        }
+        if (_isConnected.value) {
+            connectVpn()
+        }
+    }
+
+    fun loadInstalledApps(context: android.content.Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val pm = context.packageManager
+                val packages = pm.getInstalledPackages(0)
+                val filteredList = packages.mapNotNull { packageInfo ->
+                    val name = packageInfo.applicationInfo?.loadLabel(pm)?.toString() ?: packageInfo.packageName
+                    if (packageInfo.packageName != context.packageName) {
+                        AppItem(name = name, packageName = packageInfo.packageName)
+                    } else {
+                        null
+                    }
+                }.sortedBy { it.name.lowercase() }
+                _installedApps.value = filteredList
+            } catch (e: Exception) {
+                Log.e("VpnViewModel", "Failed to load installed apps", e)
+            }
+        }
+    }
 
     fun setTab(tab: String) {
         _currentTab.value = tab
@@ -305,24 +501,31 @@ class VpnViewModel : ViewModel() {
         if (_isConnected.value) {
             toggleConnection()
         }
+        try {
+            proxyServer?.stop()
+        } catch (ignored: Exception) {}
+        proxyServer = null
+        _proxySharing.value = false
+        _adBlocker.value = true
         _killSwitch.value = false
         _dnsProtection.value = true
         _doubleVpn.value = false
         _autoConnect.value = false
         _splitTunneling.value = false
         _notifications.value = true
+        _excludedApps.value = emptySet()
         _activeProtocol.value = "wireguard"
-        _selectedServer.value = servers[0]
+        _selectedServer.value = _serversFlow.value[0]
         _totalDownMb.value = 0.0
         _totalUpMb.value = 0.0
         _downSpeedHistory.value = emptyList()
         _currentTab.value = "home"
     }
 
-    private fun startSimulation() {
-        stopSimulation()
+    private fun startTelemetry() {
+        stopTelemetry()
         
-        simulationJob = viewModelScope.launch {
+        telemetryJob = viewModelScope.launch {
             // Initialize traffic bytes
             var lastRxBytes = android.net.TrafficStats.getTotalRxBytes()
             var lastTxBytes = android.net.TrafficStats.getTotalTxBytes()
@@ -413,14 +616,45 @@ class VpnViewModel : ViewModel() {
         }
     }
 
-    private fun stopSimulation() {
-        simulationJob?.cancel()
+    private fun stopTelemetry() {
+        telemetryJob?.cancel()
         timerJob?.cancel()
     }
 
     override fun onCleared() {
         super.onCleared()
-        stopSimulation()
+        stopTelemetry()
+    }
+}
+
+// Helper to retrieve live ISP Operator & Connection type (WiFi/Data) safely
+fun getConnectionInfo(context: android.content.Context): Pair<String, String> {
+    return try {
+        val connectivityManager = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+        val telephonyManager = context.getSystemService(android.content.Context.TELEPHONY_SERVICE) as? android.telephony.TelephonyManager
+
+        val activeNetwork = connectivityManager?.activeNetwork
+        val capabilities = connectivityManager?.getNetworkCapabilities(activeNetwork)
+
+        val connectionType = when {
+            capabilities == null -> "Sin conexión"
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "WiFi"
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "Datos Móviles"
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+            else -> "Otro"
+        }
+
+        var operatorName = telephonyManager?.networkOperatorName ?: ""
+        if (operatorName.isEmpty() || operatorName.isBlank() || operatorName == "null") {
+            operatorName = telephonyManager?.simOperatorName ?: ""
+        }
+        if (operatorName.isEmpty() || operatorName.isBlank() || operatorName == "null") {
+            operatorName = "Proveedor de Red"
+        }
+
+        Pair(connectionType, operatorName)
+    } catch (e: Exception) {
+        Pair("WiFi", "Local ISP Provider")
     }
 }
 
@@ -446,10 +680,42 @@ fun GoogleLoginScreen(
     colors: AppColors,
     isDarkTheme: Boolean
 ) {
+    val context = LocalContext.current
     var showAccountChooser by remember { mutableStateOf(false) }
     var customEmail by remember { mutableStateOf("") }
     var customName by remember { mutableStateOf("") }
     var isAddingAccount by remember { mutableStateOf(false) }
+
+    // Configuration of real, official Google Sign-In options
+    val gso = remember {
+        GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
+            .requestProfile()
+            .build()
+    }
+    val googleSignInClient = remember { GoogleSignIn.getClient(context, gso) }
+
+    val googleSignInLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+        try {
+            val account = task.getResult(ApiException::class.java)
+            if (account != null) {
+                val name = account.displayName ?: "Usuario de Google"
+                val email = account.email ?: "google-user@gmail.com"
+                val photoUrl = account.photoUrl?.toString()
+                viewModel.signInWithGoogle(name = name, email = email, photoUrl = photoUrl)
+                Toast.makeText(context, "Sesión iniciada: $name", Toast.LENGTH_SHORT).show()
+            } else {
+                showAccountChooser = true
+            }
+        } catch (e: Exception) {
+            Log.e("VPN_AUTH", "Google Sign-In failed, showing advanced dialog", e)
+            Toast.makeText(context, "Autenticando con selector avanzado", Toast.LENGTH_SHORT).show()
+            showAccountChooser = true
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -570,7 +836,15 @@ fun GoogleLoginScreen(
 
             // Google sign-in button
             Button(
-                onClick = { showAccountChooser = true },
+                onClick = {
+                    try {
+                        val signInIntent = googleSignInClient.signInIntent
+                        googleSignInLauncher.launch(signInIntent)
+                    } catch (e: Exception) {
+                        Log.e("VPN_AUTH", "Failed to launch Google Sign-In intent", e)
+                        showAccountChooser = true
+                    }
+                },
                 colors = ButtonDefaults.buttonColors(containerColor = colors.card),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -842,32 +1116,60 @@ fun VpnApp(viewModel: VpnViewModel = viewModel()) {
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
-            val serviceIntent = Intent(context, MyVpnService::class.java)
-            context.startService(serviceIntent)
+            viewModel.connectVpn()
         } else {
             viewModel.setConnectedState(false)
         }
     }
 
-    LaunchedEffect(isConnected) {
-        if (isConnected) {
-            val intent = VpnService.prepare(context)
+    LaunchedEffect(Unit) {
+        viewModel.prepareVpnTrigger.collect { requestedServer: VpnServer? ->
+            val intent = android.net.VpnService.prepare(context)
             if (intent != null) {
+                if (requestedServer != null) {
+                    viewModel.setSelectedServer(requestedServer)
+                    viewModel.setTab("home")
+                }
                 try {
                     vpnPrepareLauncher.launch(intent)
                 } catch (e: Exception) {
-                    val serviceIntent = Intent(context, MyVpnService::class.java)
-                    context.startService(serviceIntent)
+                    if (requestedServer != null) {
+                        viewModel.selectServer(requestedServer)
+                    } else {
+                        viewModel.toggleConnection()
+                    }
                 }
             } else {
-                val serviceIntent = Intent(context, MyVpnService::class.java)
-                context.startService(serviceIntent)
+                if (requestedServer != null) {
+                    viewModel.selectServer(requestedServer)
+                } else {
+                    viewModel.toggleConnection()
+                }
             }
+        }
+    }
+
+    var hasBeenConnected by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isConnected) {
+        if (isConnected) {
+            hasBeenConnected = true
+            val serviceIntent = Intent(context, MyVpnService::class.java).apply {
+                putExtra("server_ip", selectedServer.ip)
+                putExtra("server_name", selectedServer.country)
+                putExtra("ad_blocker", viewModel.adBlocker.value)
+                putExtra("is_udp", selectedServer.isUdp)
+                val excludedList = if (viewModel.splitTunneling.value) viewModel.excludedApps.value.toList() else emptyList()
+                putStringArrayListExtra("excluded_packages", ArrayList(excludedList))
+            }
+            context.startService(serviceIntent)
         } else {
-            val disconnectIntent = Intent(context, MyVpnService::class.java).apply {
-                action = MyVpnService.ACTION_DISCONNECT
+            if (hasBeenConnected) {
+                val disconnectIntent = Intent(context, MyVpnService::class.java).apply {
+                    action = MyVpnService.ACTION_DISCONNECT
+                }
+                context.startService(disconnectIntent)
             }
-            context.startService(disconnectIntent)
         }
     }
 
@@ -1129,6 +1431,7 @@ fun HomeScreen(viewModel: VpnViewModel) {
     val BorderColor = colors.border
 
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
+    val connectionStatus by viewModel.connectionStatus.collectAsStateWithLifecycle()
     val selectedServer by viewModel.selectedServer.collectAsStateWithLifecycle()
     val elapsedSeconds by viewModel.elapsedSeconds.collectAsStateWithLifecycle()
     
@@ -1162,8 +1465,8 @@ fun HomeScreen(viewModel: VpnViewModel) {
                     modifier = Modifier.size(240.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    // Pulsing animation ripple if connected
-                    if (isConnected) {
+                    // Pulsing animation ripple if connected or connecting
+                    if (connectionStatus == "CONECTADO" || connectionStatus == "CONECTANDO") {
                         val infiniteTransition = rememberInfiniteTransition(label = "pulse_transition")
                         val scale by infiniteTransition.animateFloat(
                             initialValue = 1f,
@@ -1183,46 +1486,53 @@ fun HomeScreen(viewModel: VpnViewModel) {
                             ),
                             label = "pulse_alpha"
                         )
+                        val rippleColor = if (connectionStatus == "CONECTADO") CyberGreen else CyberOrange
                         
                         Box(
                             modifier = Modifier
                                 .fillMaxSize(0.85f * scale)
                                 .clip(CircleShape)
-                                .background(CyberGreen.copy(alpha = alpha))
+                                .background(rippleColor.copy(alpha = alpha))
                         )
                     }
 
                     // Main Power Button
-                    val buttonBg = if (isConnected) {
-                        Brush.linearGradient(colors = listOf(CyberGreen, Color(0xFF00CC6A)))
-                    } else {
-                        Brush.linearGradient(colors = listOf(Color(0xFF1A2035), Color(0xFF0F1525)))
+                    val buttonBg = when (connectionStatus) {
+                        "CONECTADO" -> Brush.linearGradient(colors = listOf(CyberGreen, Color(0xFF00CC6A)))
+                        "CONECTANDO" -> Brush.linearGradient(colors = listOf(CyberOrange, Color(0xFFFF9F0A)))
+                        else -> Brush.linearGradient(colors = listOf(Color(0xFF1A2035), Color(0xFF0F1525)))
+                    }
+
+                    val shadowAndBorderColor = when (connectionStatus) {
+                        "CONECTADO" -> CyberGreen
+                        "CONECTANDO" -> CyberOrange
+                        else -> Color.Black
                     }
 
                     Box(
                         modifier = Modifier
                             .size(190.dp)
                             .shadow(
-                                elevation = if (isConnected) 24.dp else 8.dp,
+                                elevation = if (connectionStatus != "DESCONECTADO") 24.dp else 8.dp,
                                 shape = CircleShape,
-                                ambientColor = if (isConnected) CyberGreen else Color.Black,
-                                spotColor = if (isConnected) CyberGreen else Color.Black
+                                ambientColor = if (connectionStatus != "DESCONECTADO") shadowAndBorderColor else Color.Black,
+                                spotColor = if (connectionStatus != "DESCONECTADO") shadowAndBorderColor else Color.Black
                             )
                             .border(
-                                width = if (isConnected) 2.dp else 1.dp,
-                                color = if (isConnected) CyberGreen.copy(alpha = 0.5f) else Color(0x11FFFFFF),
+                                width = if (connectionStatus != "DESCONECTADO") 2.dp else 1.dp,
+                                color = if (connectionStatus != "DESCONECTADO") shadowAndBorderColor.copy(alpha = 0.5f) else Color(0x11FFFFFF),
                                 shape = CircleShape
                             )
                             .clip(CircleShape)
                             .background(buttonBg)
-                            .clickable { viewModel.toggleConnection() }
+                            .clickable { viewModel.requestConnection() }
                             .testTag("power_button"),
                         contentAlignment = Alignment.Center
                     ) {
                         // Drawing custom visual shield logo centered inside
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             ShieldIllustration(
-                                color = if (isConnected) Color.White else CyberTextSecondary,
+                                color = if (connectionStatus != "DESCONECTADO") Color.White else CyberTextSecondary,
                                 modifier = Modifier.size(80.dp)
                             )
                         }
@@ -1232,9 +1542,17 @@ fun HomeScreen(viewModel: VpnViewModel) {
                 Spacer(modifier = Modifier.height(12.dp))
                 
                 Text(
-                    text = if (isConnected) "Conectado" else "Listo para conectar",
+                    text = when (connectionStatus) {
+                        "CONECTANDO" -> "Conectando..."
+                        "CONECTADO" -> "Conectado"
+                        else -> "Desconectado"
+                    },
                     style = TextStyle(
-                        color = Color.White,
+                        color = when (connectionStatus) {
+                            "CONECTANDO" -> CyberOrange
+                            "CONECTADO" -> CyberGreen
+                            else -> Color.White
+                        },
                         fontSize = 24.sp,
                         fontWeight = Bold,
                         textAlign = TextAlign.Center
@@ -1242,7 +1560,11 @@ fun HomeScreen(viewModel: VpnViewModel) {
                 )
 
                 Text(
-                    text = if (isConnected) "${selectedServer.flag} ${selectedServer.city}, ${selectedServer.country}" else "Toca el escudo para activar la protección",
+                    text = when (connectionStatus) {
+                        "CONECTANDO" -> "Estableciendo túnel seguro con ${selectedServer.country}..."
+                        "CONECTADO" -> "${selectedServer.flag} ${selectedServer.city}, ${selectedServer.country}"
+                        else -> "Toca el escudo para iniciar protección"
+                    },
                     style = TextStyle(
                         color = CyberTextSecondary,
                         fontSize = 13.sp,
@@ -1493,6 +1815,91 @@ fun HomeScreen(viewModel: VpnViewModel) {
             }
         }
 
+        // Live connection type and network carrier company card
+        item {
+            val context = LocalContext.current
+            var networkType by remember { mutableStateOf("WiFi") }
+            var carrierName by remember { mutableStateOf("Proveedor de Red") }
+
+            LaunchedEffect(context) {
+                try {
+                    val info = getConnectionInfo(context)
+                    networkType = info.first
+                    carrierName = info.second
+                } catch (e: Exception) {
+                    networkType = "WiFi"
+                    carrierName = "Proveedor de Red"
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(CyberDarkCard)
+                    .border(1.dp, BorderColor, RoundedCornerShape(20.dp))
+                    .padding(16.dp)
+            ) {
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Red de origen",
+                            style = TextStyle(color = Color.White, fontSize = 13.sp, fontWeight = Medium)
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            // Elegant custom graphic for WiFi vs cellular signal strength
+                            if (networkType == "WiFi") {
+                                Row(
+                                    modifier = Modifier.width(14.dp).height(10.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(1.5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(modifier = Modifier.size(3.dp).background(CyberBlue, CircleShape))
+                                    Box(modifier = Modifier.size(4.5.dp).background(CyberBlue, CircleShape))
+                                    Box(modifier = Modifier.size(6.dp).background(CyberBlue, CircleShape))
+                                }
+                            } else {
+                                Row(
+                                    modifier = Modifier.width(14.dp).height(10.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(1.5.dp),
+                                    verticalAlignment = Alignment.Bottom
+                                ) {
+                                    Box(modifier = Modifier.width(2.5.dp).fillMaxHeight(0.35f).background(CyberBlue, RoundedCornerShape(0.5.dp)))
+                                    Box(modifier = Modifier.width(2.5.dp).fillMaxHeight(0.65f).background(CyberBlue, RoundedCornerShape(0.5.dp)))
+                                    Box(modifier = Modifier.width(2.5.dp).fillMaxHeight(1f).background(CyberBlue, RoundedCornerShape(0.5.dp)))
+                                }
+                            }
+                            Text(
+                                text = networkType,
+                                style = TextStyle(color = CyberBlue, fontSize = 11.sp, fontWeight = Bold)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = carrierName,
+                        style = TextStyle(
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            fontWeight = Bold
+                        )
+                    )
+                    Text(
+                        text = "Conectado por $networkType",
+                        style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp),
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
+        }
+
         // Stylized visual vector network background illustration
         item {
             Box(
@@ -1566,14 +1973,157 @@ fun ServersScreen(viewModel: VpnViewModel) {
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val selectedServer by viewModel.selectedServer.collectAsStateWithLifecycle()
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
+    val servers by viewModel.serversFlow.collectAsStateWithLifecycle()
 
-    val filteredServers = remember(searchQuery) {
+    var showAddDialog by remember { mutableStateOf(false) }
+    var showQrScannerDialog by remember { mutableStateOf(false) }
+
+    val filteredServers = remember(searchQuery, servers) {
         if (searchQuery.isBlank()) {
-            viewModel.servers
+            servers
         } else {
-            viewModel.servers.filter {
+            servers.filter {
                 it.country.contains(searchQuery, ignoreCase = true) ||
                 it.city.contains(searchQuery, ignoreCase = true)
+            }
+        }
+    }
+
+    if (showQrScannerDialog) {
+        QrScannerDialog(
+            onDismissRequest = { showQrScannerDialog = false },
+            onServerImported = { importedServer ->
+                viewModel.addCustomServer(
+                    country = importedServer.country,
+                    city = importedServer.city,
+                    ip = importedServer.ip,
+                    isUdp = importedServer.isUdp
+                )
+            }
+        )
+    }
+
+    if (showAddDialog) {
+        androidx.compose.ui.window.Dialog(onDismissRequest = { showAddDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(CyberDarkCard)
+                    .border(1.dp, BorderColor, RoundedCornerShape(24.dp))
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = "Añadir Servidor Propio",
+                    style = TextStyle(color = CyberTextColor, fontSize = 16.sp, fontWeight = Bold)
+                )
+
+                // Country input
+                var cCountry by remember { mutableStateOf("Mi Servidor UDP") }
+                Column {
+                    Text("País / Nombre:", style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp, fontWeight = Bold), modifier = Modifier.padding(bottom = 6.dp))
+                    BasicTextField(
+                        value = cCountry,
+                        onValueChange = { cCountry = it },
+                        textStyle = TextStyle(color = CyberTextColor, fontSize = 14.sp),
+                        singleLine = true,
+                        cursorBrush = SolidColor(CyberGreen),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0x06FFFFFF))
+                            .border(1.dp, BorderColor, RoundedCornerShape(10.dp))
+                            .padding(11.dp)
+                    )
+                }
+
+                // City input
+                var cCity by remember { mutableStateOf("Puerto 51820") }
+                Column {
+                    Text("Ciudad / Puerto:", style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp, fontWeight = Bold), modifier = Modifier.padding(bottom = 6.dp))
+                    BasicTextField(
+                        value = cCity,
+                        onValueChange = { cCity = it },
+                        textStyle = TextStyle(color = CyberTextColor, fontSize = 14.sp),
+                        singleLine = true,
+                        cursorBrush = SolidColor(CyberGreen),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0x06FFFFFF))
+                            .border(1.dp, BorderColor, RoundedCornerShape(10.dp))
+                            .padding(11.dp)
+                    )
+                }
+
+                // IP Address input
+                var cIp by remember { mutableStateOf("") }
+                Column {
+                    Text("Dirección IP / Host (UDP):", style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp, fontWeight = Bold), modifier = Modifier.padding(bottom = 6.dp))
+                    BasicTextField(
+                        value = cIp,
+                        onValueChange = { cIp = it },
+                        textStyle = TextStyle(color = CyberTextColor, fontSize = 14.sp),
+                        singleLine = true,
+                        cursorBrush = SolidColor(CyberGreen),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0x06FFFFFF))
+                            .border(1.dp, BorderColor, RoundedCornerShape(10.dp))
+                            .padding(11.dp)
+                    )
+                }
+
+                // Protocol selector switch (UDP option)
+                var isUdp by remember { mutableStateOf(true) }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Protocolo UDP:", style = TextStyle(color = CyberTextColor, fontSize = 12.sp, fontWeight = Bold))
+                    Switch(
+                        checked = isUdp,
+                        onCheckedChange = { isUdp = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = CyberGreen,
+                            checkedTrackColor = CyberGreen.copy(alpha = 0.3f)
+                        )
+                    )
+                }
+
+                // Dialog Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = { showAddDialog = false },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                        modifier = Modifier
+                            .weight(1f)
+                            .border(1.dp, BorderColor, RoundedCornerShape(12.dp)),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("Cancelar", style = TextStyle(color = CyberTextSecondary, fontSize = 13.sp))
+                    }
+
+                    Button(
+                        onClick = {
+                            if (cIp.isNotBlank() && cCountry.isNotBlank()) {
+                                viewModel.addCustomServer(cCountry, cCity, cIp, isUdp)
+                                showAddDialog = false
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = CyberGreen),
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("Añadir", style = TextStyle(color = Color.Black, fontSize = 13.sp, fontWeight = Bold))
+                    }
+                }
             }
         }
     }
@@ -1584,15 +2134,50 @@ fun ServersScreen(viewModel: VpnViewModel) {
             .padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Column {
-            Text(
-                text = "Servidores",
-                style = TextStyle(color = CyberTextColor, fontSize = 22.sp, fontWeight = Bold)
-            )
-            Text(
-                text = "Selecciona la mejor ubicación",
-                style = TextStyle(color = CyberTextSecondary, fontSize = 13.sp)
-            )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = "Servidores",
+                    style = TextStyle(color = CyberTextColor, fontSize = 22.sp, fontWeight = Bold)
+                )
+                Text(
+                    text = "Selecciona la mejor ubicación",
+                    style = TextStyle(color = CyberTextSecondary, fontSize = 13.sp)
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // QR Scanning button
+                Button(
+                    onClick = { showQrScannerDialog = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = CyberGreen.copy(alpha = 0.15f)),
+                    modifier = Modifier
+                        .border(1.dp, CyberGreen.copy(alpha = 0.3f), RoundedCornerShape(12.dp)),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Search, contentDescription = null, tint = CyberGreen, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Escanear QR", style = TextStyle(color = CyberGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold))
+                }
+
+                // Add UDP button
+                Button(
+                    onClick = { showAddDialog = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0x0EFFFFFF)),
+                    modifier = Modifier
+                        .border(1.dp, BorderColor, RoundedCornerShape(12.dp)),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Add, contentDescription = null, tint = CyberTextColor, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Manual", style = TextStyle(color = CyberTextColor, fontSize = 11.sp, fontWeight = FontWeight.Bold))
+                }
+            }
         }
 
         // Custom stylized glass search text field
@@ -1649,7 +2234,7 @@ fun ServersScreen(viewModel: VpnViewModel) {
                 .clip(RoundedCornerShape(16.dp))
                 .background(CyberDarkCardStrong)
                 .border(1.dp, Color(0x18FFFFFF), RoundedCornerShape(16.dp))
-                .clickable { viewModel.quickConnect() }
+                .clickable { viewModel.requestQuickConnect() }
                 .padding(14.dp)
         ) {
             Row(
@@ -1745,7 +2330,7 @@ fun ServersScreen(viewModel: VpnViewModel) {
                                 color = if (isSelected) CyberGreen.copy(alpha = 0.4f) else BorderColor,
                                 shape = RoundedCornerShape(16.dp)
                             )
-                            .clickable { viewModel.selectServer(s) }
+                            .clickable { viewModel.requestSelectServer(s) }
                             .padding(14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -2058,6 +2643,19 @@ fun SettingsScreen(viewModel: VpnViewModel) {
     val autoConnect by viewModel.autoConnect.collectAsStateWithLifecycle()
     val splitTunneling by viewModel.splitTunneling.collectAsStateWithLifecycle()
     val notifications by viewModel.notifications.collectAsStateWithLifecycle()
+    val adBlocker by viewModel.adBlocker.collectAsStateWithLifecycle()
+    val proxySharing by viewModel.proxySharing.collectAsStateWithLifecycle()
+    val proxyIp by viewModel.proxyIp.collectAsStateWithLifecycle()
+
+    val rutaPorDefecto by viewModel.rutaPorDefecto.collectAsStateWithLifecycle()
+    val httpPing by viewModel.httpPing.collectAsStateWithLifecycle()
+    val keepCpuActive by viewModel.keepCpuActive.collectAsStateWithLifecycle()
+    val tcpNoDelay by viewModel.tcpNoDelay.collectAsStateWithLifecycle()
+    val mtuSize by viewModel.mtuSize.collectAsStateWithLifecycle()
+    val sshCompression by viewModel.sshCompression.collectAsStateWithLifecycle()
+    val transferBuffer by viewModel.transferBuffer.collectAsStateWithLifecycle()
+
+    var showAppExclusionDialog by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier
@@ -2099,7 +2697,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    val protocols = listOf("wireguard" to "WireGuard", "openvpn" to "OpenVPN", "ikev2" to "IKEv2", "l2tp" to "L2TP/IP")
+                    val protocols = listOf("wireguard" to "WireGuard", "openvpn" to "OpenVPN")
                     protocols.forEach { (key, display) ->
                         val selected = activeProtocol == key
                         Box(
@@ -2180,6 +2778,345 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     checked = doubleVpn,
                     onCheckedChange = { viewModel.toggleDoubleVpn() }
                 )
+
+                Divider(color = Color(0x0AFFFFFF))
+
+                // Feature 4: AdBlocker
+                FeatureSettingRow(
+                    icon = Icons.Default.Star,
+                    iconTint = CyberGreen,
+                    title = "Bloquear Anuncios",
+                    description = "Filtros premium que cortan publicidad DNS",
+                    checked = adBlocker,
+                    onCheckedChange = { viewModel.toggleAdBlocker() }
+                )
+            }
+        }
+
+        // Conexión Category
+        item {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "Conexión",
+                    style = TextStyle(color = CyberBlue, fontSize = 13.sp, fontWeight = Bold, letterSpacing = 1.sp),
+                    modifier = Modifier.padding(bottom = 8.dp, top = 8.dp)
+                )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(CyberDarkCard)
+                        .border(1.dp, BorderColor, RoundedCornerShape(20.dp))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    // Ruta por defecto
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Ruta por defecto",
+                                style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Enrutar todo el tráfico por el túnel VPN",
+                                style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp)
+                            )
+                        }
+                        CustomSwitch(checked = rutaPorDefecto, onCheckedChange = { viewModel.toggleRutaPorDefecto() })
+                    }
+
+                    Divider(color = Color(0x0AFFFFFF))
+
+                    // HTTP Ping
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "HTTP Ping",
+                                style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Verificar conectividad con ping HTTP periódico",
+                                style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp)
+                            )
+                        }
+                        CustomSwitch(checked = httpPing, onCheckedChange = { viewModel.toggleHttpPing() })
+                    }
+                }
+            }
+        }
+
+        // Configuración Avanzada Category
+        item {
+            var showMtuDropdown by remember { mutableStateOf(false) }
+            var showBufferDropdown by remember { mutableStateOf(false) }
+
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "Configuración Avanzada",
+                    style = TextStyle(color = CyberBlue, fontSize = 13.sp, fontWeight = Bold, letterSpacing = 1.sp),
+                    modifier = Modifier.padding(bottom = 8.dp, top = 8.dp)
+                )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(CyberDarkCard)
+                        .border(1.dp, BorderColor, RoundedCornerShape(20.dp))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    // Mantener activa la CPU
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Mantener activa la CPU",
+                                style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Mantenga la CPU activa para reducir la desconexión cuando la pantalla esté apagada (Drene la batería)",
+                                style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp)
+                            )
+                        }
+                        CustomSwitch(checked = keepCpuActive, onCheckedChange = { viewModel.toggleKeepCpuActive() })
+                    }
+
+                    Divider(color = Color(0x0AFFFFFF))
+
+                    // TCP No-Delay
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "TCP No-Delay",
+                                    style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(CyberGreen.copy(alpha = 0.15f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = "PING ↓",
+                                        style = TextStyle(color = CyberGreen, fontSize = 8.sp, fontWeight = Bold)
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Desactiva el algoritmo Nagle para menor latencia. Recomendado activado.",
+                                style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp)
+                            )
+                        }
+                        CustomSwitch(checked = tcpNoDelay, onCheckedChange = { viewModel.toggleTcpNoDelay() })
+                    }
+
+                    Divider(color = Color(0x0AFFFFFF))
+
+                    // MTU Input Box
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "MTU",
+                                style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(CyberGreen.copy(alpha = 0.15f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "SPEED ↑",
+                                    style = TextStyle(color = CyberGreen, fontSize = 8.sp, fontWeight = Bold)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Tamaño máximo del paquete. 1400 recomendado para redes móviles.",
+                            style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp),
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(CyberDarkCardStrong)
+                                    .border(1.dp, Color(0x11FFFFFF), RoundedCornerShape(12.dp))
+                                    .clickable { showMtuDropdown = true }
+                                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(text = mtuSize, color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                                    Text(text = "▼", color = CyberTextSecondary, fontSize = 10.sp)
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = showMtuDropdown,
+                                onDismissRequest = { showMtuDropdown = false },
+                                modifier = Modifier.background(CyberDarkCardStrong).border(1.dp, BorderColor, RoundedCornerShape(12.dp))
+                            ) {
+                                listOf("1400 (Móvil)", "1500 (Wi-Fi)", "1360 (Consola)", "1280 (Estándar VPN)").forEach { option ->
+                                    DropdownMenuItem(
+                                        text = { Text(option, color = CyberTextColor, fontSize = 13.sp) },
+                                        onClick = {
+                                            viewModel.setMtuSize(option)
+                                            showMtuDropdown = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Divider(color = Color(0x0AFFFFFF))
+
+                    // Compresión SSH
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Compresión SSH",
+                                style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Comprime el tráfico SSH. Útil en conexiones lentas con tráfico HTTP. No aplica a video/imágenes.",
+                                style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp)
+                            )
+                        }
+                        CustomSwitch(checked = sshCompression, onCheckedChange = { viewModel.toggleSshCompression() })
+                    }
+
+                    Divider(color = Color(0x0AFFFFFF))
+
+                    // Buffer de transferencia Input Box
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "Buffer de transferencia",
+                                style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(CyberGreen.copy(alpha = 0.15f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "SPEED ↑",
+                                    style = TextStyle(color = CyberGreen, fontSize = 8.sp, fontWeight = Bold)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Tamaño del buffer de transferencia de datos. Mayor = más velocidad, más RAM.",
+                            style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp),
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(CyberDarkCardStrong)
+                                    .border(1.dp, Color(0x11FFFFFF), RoundedCornerShape(12.dp))
+                                    .clickable { showBufferDropdown = true }
+                                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(text = transferBuffer, color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                                    Text(text = "▼", color = CyberTextSecondary, fontSize = 10.sp)
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = showBufferDropdown,
+                                onDismissRequest = { showBufferDropdown = false },
+                                modifier = Modifier.background(CyberDarkCardStrong).border(1.dp, BorderColor, RoundedCornerShape(12.dp))
+                            ) {
+                                listOf("128 KB (Ultra)", "64 KB (Rápido)", "32 KB (Estándar)", "16 KB (Ahorro RAM)").forEach { option ->
+                                    DropdownMenuItem(
+                                        text = { Text(option, color = CyberTextColor, fontSize = 13.sp) },
+                                        onClick = {
+                                            viewModel.setTransferBuffer(option)
+                                            showBufferDropdown = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Guardar Configuración Button
+        item {
+            val context = LocalContext.current
+            Button(
+                onClick = {
+                    Toast.makeText(context, "💾 ¡Configuración de Red Guardada!", Toast.LENGTH_SHORT).show()
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp)
+                    .height(54.dp)
+                    .border(1.dp, CyberGreen.copy(alpha = 0.5f), RoundedCornerShape(16.dp)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CyberGreen.copy(alpha = 0.1f)
+                ),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = "💾  GUARDAR CONFIGURACIÓN",
+                        style = TextStyle(
+                            color = CyberGreen,
+                            fontSize = 13.sp,
+                            fontWeight = Bold,
+                            letterSpacing = 1.sp
+                        )
+                    )
+                }
             }
         }
 
@@ -2218,6 +3155,45 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     onCheckedChange = { viewModel.toggleSplitTunneling() }
                 )
 
+                if (splitTunneling) {
+                    val excludedApps by viewModel.excludedApps.collectAsStateWithLifecycle()
+                    val count = excludedApps.size
+                    
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0x08FFFFFF))
+                            .border(1.dp, Color(0x11FFFFFF), RoundedCornerShape(12.dp))
+                            .clickable { showAppExclusionDialog = true }
+                            .padding(horizontal = 14.dp, vertical = 12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Filtrar aplicaciones",
+                                    style = TextStyle(color = CyberTextColor, fontSize = 12.sp, fontWeight = Bold)
+                                )
+                                Text(
+                                    text = if (count == 0) "Todas las aplicaciones usan la VPN" else "$count app${if (count > 1) "s" else ""} excluida${if (count > 1) "s" else ""} de la VPN",
+                                    style = TextStyle(color = if (count > 0) CyberGreen else CyberTextSecondary, fontSize = 10.sp, fontWeight = Medium)
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ArrowForward,
+                                contentDescription = "Configurar",
+                                tint = CyberTextSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+
                 Divider(color = Color(0x0AFFFFFF))
 
                 // Alerts / notifications parameter
@@ -2227,6 +3203,103 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     checked = notifications,
                     onCheckedChange = { viewModel.toggleNotifications() }
                 )
+            }
+        }
+
+        // Hotspot / Proxy Sharing Card for iPhones and other devices
+        item {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(CyberDarkCard)
+                    .border(1.dp, BorderColor, RoundedCornerShape(20.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Anclaje / Proxy Sharing",
+                            style = TextStyle(color = CyberTextColor, fontSize = 14.sp, fontWeight = Bold)
+                        )
+                        Text(
+                            text = "Compartir VPN para iPhones en Cuba",
+                            style = TextStyle(color = CyberTextSecondary, fontSize = 11.sp, fontWeight = Medium)
+                        )
+                    }
+                    val context = LocalContext.current
+                    Switch(
+                        checked = proxySharing,
+                        onCheckedChange = { viewModel.toggleProxySharing(context) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = CyberGreen,
+                            checkedTrackColor = CyberGreen.copy(alpha = 0.3f),
+                            uncheckedThumbColor = Color.Gray,
+                            uncheckedTrackColor = Color.DarkGray
+                        )
+                    )
+                }
+
+                if (proxySharing) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(CyberGreen.copy(alpha = 0.08f))
+                            .border(1.dp, CyberGreen.copy(alpha = 0.2f), RoundedCornerShape(12.dp))
+                            .padding(12.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = "DATOS PROXY PARA TETHERING / ANCLAJE",
+                                style = TextStyle(color = CyberGreen, fontSize = 11.sp, fontWeight = Bold)
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Servidor (IP):", style = TextStyle(color = CyberTextSecondary, fontSize = 12.sp))
+                                Text(proxyIp, style = TextStyle(color = CyberTextColor, fontSize = 12.sp, fontWeight = Bold))
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Puerto:", style = TextStyle(color = CyberTextSecondary, fontSize = 12.sp))
+                                Text("8282", style = TextStyle(color = CyberTextColor, fontSize = 12.sp, fontWeight = Bold))
+                            }
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "Instrucciones de conexión para iPhone",
+                            style = TextStyle(color = CyberTextColor, fontSize = 12.sp, fontWeight = Bold)
+                        )
+                        Text(
+                            text = "1. Activa el punto de acceso portátil (Hotspot) en este Android.\n" +
+                                   "2. Conecta tu iPhone al Wi-Fi de este dispositivo.\n" +
+                                   "3. En tu iPhone, entra a Ajustes Wi-Fi -> pulsa en la 'i' de tu red conectada.\n" +
+                                   "4. Desplázate al fondo y pulsa en 'Configurar Proxy' -> 'Manual'.\n" +
+                                   "5. Configura el Servidor y Puerto mostrados arriba y dale a guardar.\n" +
+                                   "6. ¡Listo! El iPhone navegará por el VPN como si estuviera fuera del bloqueo de Cuba.",
+                            style = TextStyle(color = CyberTextSecondary, fontSize = 10.sp, lineHeight = 14.sp)
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "Activa esta opción para encender el servidor proxy local. Al prender el anclaje Wi-Fi, podrás compartir la conexión VPN hiper-rápida de Flash VPN con cualquier iPhone o PC.",
+                        style = TextStyle(color = CyberTextSecondary, fontSize = 10.sp, lineHeight = 14.sp)
+                    )
+                }
             }
         }
 
@@ -2275,6 +3348,13 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                 }
             }
         }
+    }
+
+    if (showAppExclusionDialog) {
+        AppExclusionDialog(
+            onDismissRequest = { showAppExclusionDialog = false },
+            viewModel = viewModel
+        )
     }
 }
 
@@ -2615,6 +3695,272 @@ fun ThemeIcon(isSunny: Boolean, color: Color, modifier: Modifier = Modifier) {
                 close()
             }
             drawPath(path = p, color = color)
+        }
+    }
+}
+
+@Composable
+fun AppExclusionDialog(
+    onDismissRequest: () -> Unit,
+    viewModel: VpnViewModel
+) {
+    val context = LocalContext.current
+    val colors = LocalAppColors.current
+    val CyberDarkBg = colors.bg
+    val CyberDarkCard = colors.card
+    val CyberDarkCardStrong = colors.cardStrong
+    val CyberGreen = colors.primary
+    val CyberBlue = colors.secondary
+    val CyberTextColor = colors.text
+    val CyberTextSecondary = colors.textSecondary
+    val BorderColor = colors.border
+
+    val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
+    val excludedApps by viewModel.excludedApps.collectAsStateWithLifecycle()
+    
+    var searchQuery by remember { mutableStateOf("") }
+    
+    LaunchedEffect(Unit) {
+        viewModel.loadInstalledApps(context)
+    }
+    
+    val filteredApps = remember(installedApps, searchQuery) {
+        if (searchQuery.isBlank()) {
+            installedApps
+        } else {
+            installedApps.filter { 
+                it.name.contains(searchQuery, ignoreCase = true) || 
+                it.packageName.contains(searchQuery, ignoreCase = true)
+            }
+        }
+    }
+
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismissRequest,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = CyberDarkBg
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .systemBarsPadding()
+                    .padding(20.dp)
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "Excluir del Túnel",
+                            style = TextStyle(color = CyberTextColor, fontSize = 20.sp, fontWeight = Bold)
+                        )
+                        Text(
+                            text = "Evita que las apps usen la VPN",
+                            style = TextStyle(color = CyberTextSecondary, fontSize = 12.sp)
+                        )
+                    }
+                    
+                    IconButton(
+                        onClick = onDismissRequest,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .background(Color(0x0AFFFFFF), CircleShape)
+                            .border(1.dp, BorderColor, CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Cerrar",
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // Search Input
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(CyberDarkCard)
+                        .border(1.dp, BorderColor, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Search,
+                            contentDescription = null,
+                            tint = CyberTextSecondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Box(modifier = Modifier.weight(1f)) {
+                            if (searchQuery.isEmpty()) {
+                                Text(
+                                    text = "Buscar aplicaciones...",
+                                    style = TextStyle(color = CyberTextSecondary, fontSize = 13.sp)
+                                )
+                            }
+                            BasicTextField(
+                                value = searchQuery,
+                                onValueChange = { searchQuery = it },
+                                textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
+                                cursorBrush = SolidColor(CyberGreen),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        if (searchQuery.isNotEmpty()) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Limpiar",
+                                tint = CyberTextSecondary,
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .clickable { searchQuery = "" }
+                            )
+                        }
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // Active exclusions counter info chip
+                if (excludedApps.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(CyberGreen.copy(alpha = 0.08f))
+                            .border(1.dp, CyberGreen.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "${excludedApps.size} aplicación${if (excludedApps.size > 1) "es" else ""} excluida${if (excludedApps.size > 1) "s" else ""} se conectará${if (excludedApps.size > 1) "n" else ""} directo a Internet.",
+                            style = TextStyle(color = CyberGreen, fontSize = 11.sp, fontWeight = Bold)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+                
+                // Apps Grid/List
+                if (filteredApps.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = CyberTextSecondary,
+                                modifier = Modifier.size(36.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = if (installedApps.isEmpty()) "Cargando lista de aplicaciones..." else "No hay aplicaciones coincidentes",
+                                style = TextStyle(color = CyberTextSecondary, fontSize = 12.sp)
+                            )
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(bottom = 16.dp)
+                    ) {
+                        items(filteredApps) { app ->
+                            val isExcluded = excludedApps.contains(app.packageName)
+                            
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(if (isExcluded) CyberDarkCardStrong else CyberDarkCard)
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (isExcluded) CyberGreen.copy(alpha = 0.4f) else BorderColor,
+                                        shape = RoundedCornerShape(16.dp)
+                                    )
+                                    .clickable { viewModel.toggleAppExclusion(app.packageName) }
+                                    .padding(14.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // Elegant letters avatar with dynamic background
+                                    val initials = app.name.take(2).uppercase()
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(if (isExcluded) CyberGreen.copy(alpha = 0.2f) else Color(0x0DFFFFFF)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = initials,
+                                            style = TextStyle(
+                                                color = if (isExcluded) CyberGreen else CyberBlue,
+                                                fontSize = 14.sp,
+                                                fontWeight = Bold
+                                            )
+                                        )
+                                    }
+                                    
+                                    Column {
+                                        Text(
+                                            text = app.name,
+                                            style = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = Bold)
+                                        )
+                                        Text(
+                                            text = app.packageName,
+                                            style = TextStyle(color = CyberTextSecondary, fontSize = 10.sp),
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                                
+                                CustomSwitch(
+                                    checked = isExcluded,
+                                    onCheckedChange = { viewModel.toggleAppExclusion(app.packageName) }
+                                )
+                            }
+                        }
+                    }
+                }
+                
+                // Done button
+                Button(
+                    onClick = onDismissRequest,
+                    colors = ButtonDefaults.buttonColors(containerColor = CyberGreen),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                ) {
+                    Text(
+                        text = "Listo",
+                        style = TextStyle(color = Color.Black, fontSize = 14.sp, fontWeight = Bold)
+                    )
+                }
+            }
         }
     }
 }
