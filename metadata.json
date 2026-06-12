@@ -1,0 +1,6 @@
+{
+  "name": "Secure VPN",
+  "description": "Premium VPN connection client with real-time stats and intelligent server selection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
