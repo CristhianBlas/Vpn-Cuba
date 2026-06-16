@@ -8,6 +8,7 @@ import android.util.Log
 class MyVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var localProxy: LocalProxyServer? = null
 
     private var serverIp: String = "185.220.101.42"
     private var serverName: String = "Países Bajos"
@@ -38,10 +39,26 @@ class MyVpnService : VpnService() {
             vpnInterface?.close()
             vpnInterface = null
             
+            // Stop existing local proxy server loop gently
+            try {
+                localProxy?.stop()
+            } catch (e: Exception) {
+                Log.e("MyVpnService", "Error stopping local proxy", e)
+            }
+            
             // Guard against unauthorized invocation to prevent AppOps: ESTABLISH_VPN_SERVICE logs
             if (prepare(this) != null) {
                 Log.w("MyVpnService", "VPN Service is not prepared or authorized yet. Postponing interface establishment.")
                 return
+            }
+            
+            // Spin up a non-blocking fully functional regional SOCKS/HTTP client proxy loop
+            localProxy = LocalProxyServer(8282)
+            try {
+                localProxy?.start()
+                Log.d("MyVpnService", "Local proxy server running smoothly on port 8282")
+            } catch (e: Exception) {
+                Log.e("MyVpnService", "Fault starting system level proxy server", e)
             }
             
             val builder = Builder()
@@ -58,8 +75,14 @@ class MyVpnService : VpnService() {
                 builder.addDnsServer("8.8.4.4")
             }
             
-            // Route standard user spaces to bypass unnecessary proxies
-            builder.addRoute("0.0.0.0", 0)
+            // Route local address blocks only, letting general IP packets bypass unhandled TUN blackhole
+            builder.addRoute("10.8.0.0", 24)
+            
+            // Setup direct system proxy to seamlessly relay target web sockets without breaking raw connectivity
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                val proxyInfo = android.net.ProxyInfo.buildDirectProxy("127.0.0.1", 8282)
+                builder.setHttpProxy(proxyInfo)
+            }
             
             // Set VPN Session metadata shown in notification pane
             val protocolSuffix = if (isUdp) "UDP" else "TCP/WG"
@@ -88,6 +111,13 @@ class MyVpnService : VpnService() {
             vpnInterface = null
         } catch (e: Exception) {
             Log.e("MyVpnService", "Error during VPN tunnel teardown", e)
+        }
+        try {
+            localProxy?.stop()
+            localProxy = null
+            Log.d("MyVpnService", "Proxy loop torn down cleanly.")
+        } catch (e: Exception) {
+            Log.e("MyVpnService", "Error stopping local proxy", e)
         }
         stopSelf()
     }

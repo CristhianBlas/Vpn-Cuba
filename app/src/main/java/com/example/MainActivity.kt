@@ -324,14 +324,31 @@ class VpnViewModel : ViewModel() {
             _upSpeed.value = 0.0
             _ping.value = 0
             
-            // Simula conexión real de handshake de 1 a 1.2 segundos
+            // Wait for 1.2 second to let connection lookups proceed
             kotlinx.coroutines.delay(1200)
             
-            _connectionStatus.value = "CONECTADO"
-            _isConnected.value = true
-            _elapsedSeconds.value = 0L
-            _ping.value = _selectedServer.value.ping
-            startTelemetry()
+            // Perform a real DNS & connectivity check to make sure internet is working!
+            val isOnline = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                try {
+                    val socket = java.net.Socket()
+                    socket.connect(java.net.InetSocketAddress("8.8.8.8", 53), 1500)
+                    socket.close()
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            
+            if (isOnline) {
+                _connectionStatus.value = "CONECTADO"
+                _isConnected.value = true
+                _elapsedSeconds.value = 0L
+                _ping.value = _selectedServer.value.ping
+                startTelemetry()
+            } else {
+                _connectionStatus.value = "DESCONECTADO"
+                _isConnected.value = false
+            }
         }
     }
 
@@ -870,6 +887,42 @@ fun GoogleLoginScreen(
                         text = "Iniciar Sesión con Google",
                         style = TextStyle(
                             color = colors.text,
+                            fontSize = 15.sp,
+                            fontWeight = Bold
+                        )
+                    )
+                }
+            }
+
+            // Quick bypass Access for smooth offline and guest experience
+            OutlinedButton(
+                onClick = {
+                    viewModel.signInWithGoogle(
+                        name = "Invitado Seguro",
+                        email = "secure.guest@gmail.com"
+                    )
+                    Toast.makeText(context, "Sesión iniciada como Invitado", Toast.LENGTH_SHORT).show()
+                },
+                border = BorderStroke(1.dp, colors.primary.copy(alpha = 0.5f)),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.primary),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        tint = colors.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = "Acceso Directo (Invitado)",
+                        style = TextStyle(
                             fontSize = 15.sp,
                             fontWeight = Bold
                         )
